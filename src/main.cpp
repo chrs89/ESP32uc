@@ -1,26 +1,113 @@
 #include <Arduino.h>
-#define seconds_to_trigger_DeepSleep 3600 // Timer in seconds until sleep mode is triggered 
+#include <ArduinoJson.h>
 
-#include "BluetoothSerial.h"
+// Deep Sleep
+#define seconds_to_trigger_DeepSleep 600 // Timer in seconds until sleep mode is triggered 
 
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
-#endif
-// Bluetooth Serial object
-BluetoothSerial SerialBT;
 
+// Timer
 #define timer_prescale 64000
-#define timer1_prescale 80
-
-#define ledPIN 12
-
-hw_timer_t *Timer1_Cfg = NULL;
-
-
 hw_timer_t *Timer0_Cfg = NULL;
 int32_t counter = 0;
 RTC_DATA_ATTR int bootCount = 0;
- 
+
+//BLE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define SERVICE_UUID             "DFCD0001-36E1-4688-B7F5-EA07361B26A8"
+#define START_CHARACTERISTIC_UUID "DFCD000A-36E1-4688-B7F5-EA07361B26A8"
+#define STOP_CHARACTERISTIC_UUID  "DFCD000B-36E1-4688-B7F5-EA07361B26A8"
+#define SENSOR_CHARACTERISTIC_UUID "DFCD000C-36E1-4688-B7F5-EA07361B26A8"
+
+bool sendData = false; // Flag to indicate whether to send sensor data
+bool resetDSTimer = false; // Flag to reset DeepSleep timer
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pStartCharacteristic = NULL;
+BLECharacteristic* pStopCharacteristic = NULL;
+BLECharacteristic* pSensorCharacteristic=NULL;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        // On client connect
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        // On client disconnect
+        sendData = false; // Stop sending sensor data on disconnect
+    }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+
+        if (value.length() > 0) {
+            if (pCharacteristic == pStartCharacteristic && value[0] == 0x01) {
+                sendData = true; // Start sending sensor data
+                resetDSTimer = true; //
+            } else if (pCharacteristic == pStopCharacteristic && value[0] == 0x01) {
+                sendData = false; // Stop sending sensor data
+            }
+        }
+    }
+};
+
+void setupBLE() {
+    BLEDevice::init("DFRobot_ESP32");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID));
+
+    pStartCharacteristic = pService->createCharacteristic(
+                             BLEUUID(START_CHARACTERISTIC_UUID),
+                             BLECharacteristic::PROPERTY_WRITE
+                           );
+    pStartCharacteristic->setCallbacks(new MyCallbacks());
+
+    pStopCharacteristic = pService->createCharacteristic(
+                             BLEUUID(STOP_CHARACTERISTIC_UUID),
+                             BLECharacteristic::PROPERTY_WRITE
+                           );
+    pStopCharacteristic->setCallbacks(new MyCallbacks());
+
+    // Create the characteristic for sensor data
+    pSensorCharacteristic = pService->createCharacteristic(
+                             BLEUUID(SENSOR_CHARACTERISTIC_UUID), // Replace with your sensor characteristic UUID
+                             BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+                           );
+
+    pSensorCharacteristic->addDescriptor(new BLE2902());
+    pService->start();
+
+    BLEAdvertising* pAdvertising = pServer->getAdvertising();
+    pAdvertising->start();
+}
+
+// GPIO Configuration
+#define ledPIN 12
+#define led1PIN 4
+#define resetButtonPin 39 // GPIO 39
+bool resetButtonPressed = false;
+
+// Sensor Configuration
+long lastMsg = 0;
+bool bSensorValue = false; // flag for fetching sensor value
+double sensorValue = 0;
+String dataToSend;
+
+#include "HX711.h"
+//HX711 Configuration
+HX711 scale;  // Initializes library functions.
+double calibration_factor = -20328; // Defines calibration factor we'll use for calibrating.
+// HX711 circuit wiring
+#define SDA 21
+#define SCL 22
+
 void IRAM_ATTR Timer0_ISR()
 {
     counter++;
@@ -28,12 +115,6 @@ void IRAM_ATTR Timer0_ISR()
     
 }
 
-void IRAM_ATTR Timer1_ISR()
-{
-  counter++;
-  digitalWrite(ledPIN,!digitalRead(ledPIN));
-    
-}
 
 /*
 Method to print the reason by which ESP32
@@ -59,7 +140,7 @@ void setup()
 {   
     Serial.begin(9600);
     
-    delay(1000); //Take some time to open up the Serial Monitor
+    setupBLE();
     
     // Initialize Timer Interrupt
     Serial.println("Interrupt Initialized");
@@ -67,11 +148,6 @@ void setup()
     timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
     timerAlarmWrite(Timer0_Cfg, 1250*seconds_to_trigger_DeepSleep, true);
     timerAlarmEnable(Timer0_Cfg);
-
-    Timer1_Cfg = timerBegin(1,timer1_prescale, true); // Prescaler set to 80*1e6 which means timer ticks every second
-    timerAttachInterrupt(Timer1_Cfg, &Timer1_ISR, true);
-    timerAlarmWrite(Timer1_Cfg, 1000, true);
-    timerAlarmEnable(Timer1_Cfg);
 
     //Increment boot number and print it every reboot
     ++bootCount;
@@ -96,20 +172,96 @@ void setup()
     /*
         Initialize Bluetooth Classic Interface
     */
-    SerialBT.begin("ESP32_one");       //Bluetooth device name 
-    Serial.println("The device started, now you can pair it with bluetooth!");
-
+   
     pinMode(ledPIN, OUTPUT);
+    pinMode(led1PIN, OUTPUT);
+    pinMode(resetButtonPin, INPUT_PULLDOWN);
+
+    scale.set_gain(64);
+    scale.begin(SDA,SCL);
+    scale.tare();          // Resets the scale to 0.
+
+    delay(1000); //Take some time to open up the Serial Monitor
 }
 
 void loop()
 {
-    delay(1000);
-    Serial.println(counter);
-    Serial.println("active mode");
+    long now = millis();
 
-    if (bootCount == 10)
+
+    // Check if User Reset is triggered by Button
+    if (digitalRead(resetButtonPin) == HIGH) {
+        delay(50); // Debouncing delay
+        if (digitalRead(resetButtonPin) == HIGH) {
+            resetButtonPressed = true;
+        }
+    } else {
+        // Reset if the button was pressed
+        if (resetButtonPressed) {
+            Serial.println("Reset button pressed. Resetting...");
+            delay(100); // Delay for stability
+            ESP.restart(); // Trigger a software reset
+        }
+        resetButtonPressed = false;
+    }
+    
+    //Serial.println(counter);
+    //Serial.println("active mode");
+
+    
+
+    if (resetDSTimer)
     {
         timerRestart(Timer0_Cfg);
+        Serial.println("Reset DST"); // Reset Deep Sleep Timer
+        resetDSTimer = false;
     }
+
+
+    /*
+    Get Value from weight Cell here in if loop the code is waiting 20 ms to send a new value
+    within this 20 ms a new value shall be fetched from the weight cell
+    */
+
+    if (sendData) {
+        char sens_str[8];
+        /*
+        if (!bSensorValue){
+          digitalWrite(led1PIN, HIGH);
+          float sens = scale.get_value(1)/(calibration_factor);
+          dtostrf(sens, 1, 2, sens_str);
+          // Store timestamp as binary data (unsigned long)
+          digitalWrite(led1PIN, LOW);
+          }
+        */
+        if (now - lastMsg > 16) {
+            digitalWrite(led1PIN, HIGH);
+            float sens = scale.get_value(1)/(calibration_factor);
+            dtostrf(sens, 1, 2, sens_str);
+            // Store timestamp as binary data (unsigned long)
+            digitalWrite(led1PIN, LOW);
+            // Convert the sensor value to a string
+            //String dataToSend = String(sensorValue);
+            // Code to read sensor data and send it to the connected client
+            // Replace this with your sensor data transmission logic
+            digitalWrite(ledPIN, HIGH);
+            pSensorCharacteristic->setValue(sens_str);
+            pSensorCharacteristic->notify();
+            digitalWrite(ledPIN, LOW);
+            lastMsg = now;
+            bSensorValue = false;
+        }
+    }
+    else if (!sendData)
+    {
+        // Save Energy
+        // Shut down Scale
+        // Further Measures to save energy
+        Serial.println("Passive Moode - not sending but providing");
+
+    }
+    
+
 }
+
+
