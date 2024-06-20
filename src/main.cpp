@@ -38,6 +38,9 @@ class MyServerCallbacks : public BLEServerCallbacks {
     void onDisconnect(BLEServer* pServer) {
         // On client disconnect
         sendData = false; // Stop sending sensor data on disconnect
+        BLEAdvertising* pAdvertising = pServer->getAdvertising();
+        pAdvertising->start(); // Restart advertising
+        Serial.println("Device disconnected, restarting advertising");
     }
 };
 
@@ -57,7 +60,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 };
 
 void setupBLE() {
-    BLEDevice::init("DFRobot_ESP32");
+    BLEDevice::init("SmartEdge");
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -84,8 +87,16 @@ void setupBLE() {
     pSensorCharacteristic->addDescriptor(new BLE2902());
     pService->start();
 
-    BLEAdvertising* pAdvertising = pServer->getAdvertising();
-    pAdvertising->start();
+    //BLEAdvertising* pAdvertising = pServer->getAdvertising(); //this still is working for backward compatibility
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
+    pAdvertising->setMinPreferred(0x12);
+    
+    BLEDevice::startAdvertising();
+    //pAdvertising->start();
 }
 
 // GPIO Configuration
@@ -103,7 +114,7 @@ String dataToSend;
 #include "HX711.h"
 //HX711 Configuration
 HX711 scale;  // Initializes library functions.
-double calibration_factor = -20328; // Defines calibration factor we'll use for calibrating.
+double calibration_factor = -55080;//-20328; // Defines calibration factor we'll use for calibrating.
 // HX711 circuit wiring
 #define SDA 21
 #define SCL 22
@@ -177,6 +188,7 @@ void setup()
     pinMode(led1PIN, OUTPUT);
     pinMode(resetButtonPin, INPUT_PULLDOWN);
 
+    
     scale.set_gain(64);
     scale.begin(SDA,SCL);
     scale.tare();          // Resets the scale to 0.
@@ -188,7 +200,7 @@ void loop()
 {
     long now = millis();
 
-
+    /*
     // Check if User Reset is triggered by Button
     if (digitalRead(resetButtonPin) == HIGH) {
         delay(50); // Debouncing delay
@@ -204,6 +216,8 @@ void loop()
         }
         resetButtonPressed = false;
     }
+
+    */
     
     //Serial.println(counter);
     //Serial.println("active mode");
@@ -234,7 +248,7 @@ void loop()
           digitalWrite(led1PIN, LOW);
           }
         */
-        if (now - lastMsg > 16) {
+        if (now - lastMsg > 160) { // former 16 for ~80 Hz resoulution 
             digitalWrite(led1PIN, HIGH);
             float sens = scale.get_value(1)/(calibration_factor);
             dtostrf(sens, 1, 2, sens_str);
@@ -250,6 +264,8 @@ void loop()
             digitalWrite(ledPIN, LOW);
             lastMsg = now;
             bSensorValue = false;
+
+            Serial.println(sens); // Reset Deep Sleep Timer
         }
     }
     else if (!sendData)
